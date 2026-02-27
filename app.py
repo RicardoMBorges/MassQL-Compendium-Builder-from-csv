@@ -377,7 +377,8 @@ with st.sidebar:
     st.markdown("---")
     group_mode = st.radio("Compendium organization", ["Class", "Class + Subclass (Diacyl vs Lyso)"], index=0)
 
-uploaded = st.file_uploader("Upload the formula file (csv/tsv)", type=["csv", "tsv", "txt"])
+uploaded = st.file_uploader("Upload the formula file (csv/tsv)", type=["csv", "tsv", "txt"],
+    help="This CSV file should be ',' separated with column headers 'Category','Class','FA1','FA2',FA3'(if present),'SumDB','Formula'.")
 
 if uploaded and adducts:
     try:
