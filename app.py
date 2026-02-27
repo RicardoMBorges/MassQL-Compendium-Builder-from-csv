@@ -381,27 +381,36 @@ uploaded = st.file_uploader("Upload the formula file (csv/tsv)", type=["csv", "t
 
 if uploaded and adducts:
     try:
+        # -----------------------------
+        # Load input table
+        # -----------------------------
         df_in = read_table_autodetect(uploaded)
         st.success(f"Loaded {len(df_in):,} rows.")
 
-        # Column detection messages (case-insensitive)
-        has_frags = _find_column_case_insensitive(df_in, "fragments") is not None
-        has_nl = (
-            _find_column_case_insensitive(df_in, "neutral loss") is not None
-            or _find_column_case_insensitive(df_in, "neutral_loss") is not None
-            or _find_column_case_insensitive(df_in, "neutralloss") is not None
+        # -----------------------------
+        # Detect optional columns (case-insensitive)
+        # -----------------------------
+        frag_in_col = _find_column_case_insensitive(df_in, "fragments")
+
+        nl_in_col = (
+            _find_column_case_insensitive(df_in, "neutral loss")
+            or _find_column_case_insensitive(df_in, "neutral_loss")
+            or _find_column_case_insensitive(df_in, "neutralloss")
         )
 
-        if has_frags:
-            st.info("Detected column 'Fragments/fragments' (MS2PROD constraints available).")
+        if frag_in_col:
+            st.info(f"Detected fragments column: '{frag_in_col}' (MS2PROD constraints available).")
         else:
-            st.warning("No 'Fragments/fragments' column found (MS2PROD toggle will error if enabled).")
+            st.warning("No fragments column found (MS2PROD toggle will error if enabled).")
 
-        if has_nl:
-            st.info("Detected column 'Neutral Loss' (MS2NL constraints available).")
+        if nl_in_col:
+            st.info(f"Detected neutral-loss column: '{nl_in_col}' (MS2NL constraints available).")
         else:
-            st.warning("No 'Neutral Loss' column found (MS2NL toggle will error if enabled).")
+            st.warning("No neutral-loss column found (MS2NL toggle will error if enabled).")
 
+        # -----------------------------
+        # Generate
+        # -----------------------------
         if st.button("Generate compendia", type="primary"):
             with st.spinner("Generating queries and compendia..."):
                 df_out = generate_queries(
@@ -415,9 +424,13 @@ if uploaded and adducts:
                     use_nl=use_nl,
                     nl_tol=nl_tol,
                     nl_ip=nl_ip,
-                )   
+                )
 
             st.success(f"Generated {len(df_out):,} queries.")
+
+            # -----------------------------
+            # Preview
+            # -----------------------------
             st.markdown("### Preview")
 
             frag_out_col = _find_column_case_insensitive(df_out, "fragments")
@@ -427,21 +440,20 @@ if uploaded and adducts:
                 or _find_column_case_insensitive(df_out, "neutralloss")
             )
 
-            preview_cols = ["Class", "Subclass", "Title", "Query"]
-
-            # Insert MS2-related columns (if present) right before Title/Query area
-            if use_ms2 and frag_out_col is not None:
-                preview_cols.insert(3, frag_out_col)
-
-            if use_nl and nl_out_col is not None:
-                preview_cols.insert(3, nl_out_col)
+            preview_cols = ["Class", "Subclass"]
+            if use_ms2 and frag_out_col:
+                preview_cols.append(frag_out_col)
+            if use_nl and nl_out_col:
+                preview_cols.append(nl_out_col)
+            preview_cols += ["Title", "Query"]
 
             st.dataframe(df_out[preview_cols].head(30), use_container_width=True)
 
-            # Build compendia dict: filename -> df
+            # -----------------------------
+            # Build compendia per group
+            # -----------------------------
             compendia: Dict[str, pd.DataFrame] = {}
 
-            # Build suffix that reflects what is enabled
             suffix = "MS1"
             if use_ms2:
                 suffix += "_MS2PROD"
@@ -450,40 +462,43 @@ if uploaded and adducts:
             suffix += ".tsv"
 
             if group_mode == "Class":
-                for cls, subdf in df_out.groupby(["Class"]):
-                    cls_name = cls if isinstance(cls, str) else cls[0]
-                    fname = f"Compendium_{cls_name}_{suffix}"
+                for cls, subdf in df_out.groupby("Class"):
+                    fname = f"Compendium_{cls}_{suffix}"
                     compendia[fname] = subdf
             else:
                 for (cls, subcls), subdf in df_out.groupby(["Class", "Subclass"]):
                     fname = f"MassQL_compendia_{cls}_{subcls}_{suffix}"
                     compendia[fname] = subdf
 
-            # README
-            #adducts_readme = [f"[M+{a}]+" for a in adducts]
-            #if include_dimers:
-            #    adducts_readme.append("[2M+H]+")
+            # -----------------------------
+            # README (FIX: define adducts_readme)
+            # -----------------------------
+            adducts_readme = [f"[{a}]+" for a in adducts]
+
             readme = (
                 "MS1/MS2 MassQL Compendia\n"
                 f"- MS1: TOLERANCEMZ={tol_ms1}, INTENSITYPERCENT={ip_ms1}\n"
                 f"- Adducts={','.join(adducts_readme)}\n"
                 f"- MS2PROD enabled={use_ms2}\n"
                 f"- MS2NL enabled={use_nl}\n"
-            )   
+            )
             if use_ms2:
                 readme += f"- MS2PROD: TOLERANCEMZ={tol_ms2}, INTENSITYPERCENT={ip_ms2}\n"
-                readme += "- MS2PROD Fragments source column: 'Fragments/fragments'\n"
+                readme += f"- MS2PROD fragments source column: '{frag_in_col or 'NOT FOUND'}'\n"
             if use_nl:
                 readme += f"- MS2NL: TOLERANCEMZ={nl_tol}, INTENSITYPERCENT={nl_ip}\n"
-                readme += "- MS2NL Neutral Loss source column: 'Neutral Loss' (case-insensitive)\n"
+                readme += f"- MS2NL neutral-loss source column: '{nl_in_col or 'NOT FOUND'}'\n"
 
+            # -----------------------------
+            # Downloads
+            # -----------------------------
             zip_bytes = build_zip(compendia, readme_text=readme)
 
             st.download_button(
                 "Download ZIP (one compendium TSV per group)",
                 data=zip_bytes,
                 file_name="MassQL_compendia.zip",
-                mime="application/zip"
+                mime="application/zip",
             )
 
             meta_csv = df_out.to_csv(index=False).encode("utf-8")
@@ -491,7 +506,7 @@ if uploaded and adducts:
                 "Download full metadata CSV (all queries)",
                 data=meta_csv,
                 file_name="MassQL_queries_full.csv",
-                mime="text/csv"
+                mime="text/csv",
             )
 
     except Exception as e:
