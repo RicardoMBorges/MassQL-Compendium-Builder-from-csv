@@ -1,5 +1,8 @@
-# app.py
-# Streamlit app to build MS1 MassQL compendia grouped by Class / Subclass and export as ZIP
+# --- ADD THIS FEATURE TO YOUR EXISTING app.py ---
+# MS2 fragment constraints (optional) read from CSV column "fragments"
+# Builds an additional clause:
+#   AND MS2PROD=(m1 OR m2 OR ...):TOLERANCEMZ=xx:INTENSITYPERCENT=xxx
+# MS2 tolerances are independent from MS1 tolerances.
 
 import io
 import re
@@ -10,7 +13,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="GPL MS1 MassQL Compendium Builder", layout="wide")
+st.set_page_config(page_title="GPL MS1/MS2 MassQL Compendium Builder", layout="wide")
 
 MONO_MASS = {
     "C": 12.0,
@@ -29,6 +32,29 @@ ADDUCT_SHIFT = {
 
 FORMULA_TOKEN_RE = re.compile(r"([A-Z][a-z]?)(\d*)")
 
+def read_table_autodetect(uploaded_file) -> pd.DataFrame:
+    """
+    Accepts comma-, semicolon-, or tab-separated text files.
+    Uses pandas sep=None + python engine to sniff delimiter,
+    and falls back to common separators if needed.
+    """
+    data = uploaded_file.getvalue()  # bytes
+    text = data.decode("utf-8", errors="replace")
+
+    # 1) Try delimiter sniffing
+    try:
+        return pd.read_csv(io.StringIO(text), sep=None, engine="python")
+    except Exception:
+        pass
+
+    # 2) Fallbacks (ordered)
+    for sep in ["\t", ";", ","]:
+        try:
+            return pd.read_csv(io.StringIO(text), sep=sep)
+        except Exception:
+            continue
+
+    raise ValueError("Could not read the file. Please upload a CSV/TSV with separators: tab, ';', or ','.")
 
 def parse_formula(formula: str) -> Dict[str, int]:
     counts: Dict[str, int] = {}
@@ -58,30 +84,79 @@ def build_title(row: pd.Series) -> str:
     parts = [cls]
     if fa1:
         parts.append(fa1)
-    if fa2:
+    if fa2 and fa2.lower() != "nan":
         parts.append(fa2)
-    if fa3:
+    if fa3 and fa3.lower() != "nan":
         parts.append(fa3)
     parts.append(f"DB{sumdb}")
 
     return "_".join(parts).replace(" ", "")
 
 
-def build_ms1_query(mz_list: List[float], tol: float, intensity_percent: int) -> str:
+def build_ms1_clause(mz_list: List[float], tol_ms1: float, ip_ms1: int) -> str:
     mz_str = " OR ".join([f"{mz:.6f}" for mz in mz_list])
-    return (
-        f"QUERY scaninfo(MS1DATA) WHERE MS1MZ=({mz_str})"
-        f":TOLERANCEMZ={tol}:INTENSITYPERCENT={intensity_percent}"
-    )
+    return f"MS1MZ=({mz_str}):TOLERANCEMZ={tol_ms1}:INTENSITYPERCENT={ip_ms1}"
+
+
+# ---- MS2 parsing + clause ----
+FRAG_SPLIT_RE = re.compile(r"[,\s;|]+")
+
+def parse_Fragments_cell(cell: str) -> List[float]:
+    """
+    Accepts Fragments like:
+      "184.0733, 104.1069; 86.0964"
+      "184.0733 104.1069 86.0964"
+      "[184.0733,104.1069]"
+    Returns sorted unique floats.
+    """
+    s = safe_str(cell)
+    if not s or s.lower() == "nan":
+        return []
+    s = s.strip().strip("[](){}")
+    parts = [p for p in FRAG_SPLIT_RE.split(s) if p]
+    frags = []
+    for p in parts:
+        try:
+            frags.append(float(p))
+        except ValueError:
+            # ignore tokens that are not numbers
+            pass
+    # unique, stable sort
+    frags = sorted(set(frags))
+    return frags
+
+
+def build_ms2_clause(frag_mzs: List[float], tol_ms2: float, ip_ms2: int) -> str:
+    """
+    AND MS2PROD=(m1 OR m2 OR ...):TOLERANCEMZ=xx:INTENSITYPERCENT=xxx
+    """
+    if not frag_mzs:
+        return ""
+    mz_str = " OR ".join([f"{mz:.6f}" for mz in frag_mzs])
+    return f" AND MS2PROD=({mz_str}):TOLERANCEMZ={tol_ms2}:INTENSITYPERCENT={ip_ms2}"
+
+def build_full_query(ms1_clause: str, ms2_clause: str, ms1data_key: str = "MS1DATA") -> str:
+    # Keep your existing structure:
+    return f"QUERY scaninfo({ms1data_key}) WHERE {ms1_clause}{ms2_clause}"
 
 
 def infer_subclass(row: pd.Series) -> str:
-    # If FA2 is empty -> lyso (monoacyl), else diacyl
     fa2 = safe_str(row.get("FA2", ""))
     return "Lyso" if fa2 == "" or fa2.lower() == "nan" else "Diacyl"
 
 
-def generate_queries(df: pd.DataFrame, adducts: List[str], tol: float, intensity_percent: int) -> pd.DataFrame:
+def generate_queries(
+    df: pd.DataFrame,
+    adducts: List[str],
+    tol_ms1: float,
+    ip_ms1: int,
+    use_ms2: bool,
+    tol_ms2: float,
+    ip_ms2: int,
+    use_nl: bool,
+    nl_tol: float,
+    nl_ip: int,
+) -> pd.DataFrame:
     required = {"Class", "FA1", "FA2", "SumDB", "Formula"}
     missing = required - set(df.columns)
     if missing:
@@ -108,36 +183,139 @@ def generate_queries(df: pd.DataFrame, adducts: List[str], tol: float, intensity
             new_titles.append(t if seen[t] == 1 else f"{t}_{seen[t]}")
         df["Title"] = new_titles
 
-    # Build query
     def mzs(neutral_mass: float) -> List[float]:
         return [neutral_mass + ADDUCT_SHIFT[a] for a in adducts]
 
     df["Adducts"] = ",".join([f"[M+{a}]+" for a in adducts])
     df["AdductMZs"] = df["NeutralMass"].apply(lambda m: ",".join([f"{x:.6f}" for x in mzs(m)]))
-    df["Query"] = df["NeutralMass"].apply(lambda m: build_ms1_query(mzs(m), tol, intensity_percent))
 
-    return df
+    # MS1 clause
+    df["_ms1_mzs"] = df["NeutralMass"].apply(mzs)
+    df["_ms1_clause"] = df["_ms1_mzs"].apply(lambda L: build_ms1_clause(L, tol_ms1, ip_ms1))
+
+    # -------------------------
+    # MS2 clauses (independent)
+    # -------------------------
+
+    # (A) MS2PROD from fragments
+    frag_col = None
+    if use_ms2:
+        frag_col = _find_column_case_insensitive(df, "fragments")
+        if frag_col is None:
+            raise ValueError("MS2PROD enabled, but file has no 'Fragments/fragments' column (case-insensitive).")
+        df["_frags"] = df[frag_col].apply(parse_Fragments_cell)
+        df["_ms2prod_clause"] = df["_frags"].apply(lambda fr: build_ms2_clause(fr, tol_ms2, ip_ms2))
+    else:
+        df["_ms2prod_clause"] = ""
+
+    # (B) MS2NL from neutral loss
+    nl_col = None
+    if use_nl:
+        nl_col = _find_column_case_insensitive(df, "neutral loss")
+        if nl_col is None:
+            nl_col = _find_column_case_insensitive(df, "neutral_loss") or _find_column_case_insensitive(df, "neutralloss")
+        if nl_col is None:
+            raise ValueError("MS2NL enabled, but file has no 'Neutral Loss' column (case-insensitive).")
+
+        df["_nl_val"] = df[nl_col].apply(_parse_float_cell)
+        df["_ms2nl_clause"] = df["_nl_val"].apply(lambda v: build_ms2nl_clause(v, nl_tol, nl_ip))
+    else:
+        df["_ms2nl_clause"] = ""
+
+    # Combine
+    df["_ms2_clause"] = df["_ms2prod_clause"] + df["_ms2nl_clause"]
+
+    # Final query
+    df["Query"] = df.apply(lambda r: build_full_query(r["_ms1_clause"], r["_ms2_clause"]), axis=1)
+
+    # Output columns
+    keep_cols = [
+        "Title", "Query", "Formula", "NeutralMass", "Adducts", "AdductMZs",
+        "Class", "Subclass", "FA1", "FA2", "SumDB"
+    ]
+    if "FA3" in df.columns:
+        keep_cols.insert(10, "FA3")
+    if use_ms2 and frag_col is not None:
+        keep_cols.append(frag_col)
+    if use_nl and nl_col is not None:
+        keep_cols.append(nl_col)
+
+    return df[keep_cols]
 
 
 def to_compendium_tsv(df: pd.DataFrame) -> bytes:
-    # Minimal columns for a compendium file:
-    # Title \t Query
     out = df[["Title", "Query"]].copy()
     return out.to_csv(sep="\t", index=False).encode("utf-8")
 
 
-def build_zip(compendia: Dict[str, pd.DataFrame]) -> bytes:
+def build_zip(compendia: Dict[str, pd.DataFrame], readme_text: str | None = None) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if readme_text:
+            zf.writestr("README.txt", readme_text)
         for filename, subdf in compendia.items():
             zf.writestr(filename, to_compendium_tsv(subdf))
     return buf.getvalue()
 
-# -----------------------------
-# LOGOs
-# -----------------------------
+# ---- MS2 / NL2 parsing + clause ----
+def _find_column_case_insensitive(df: pd.DataFrame, target: str) -> str | None:
+    """
+    target: canonical name like 'Fragments' or 'neutral loss'
+    Returns the actual column name in df if found (case-insensitive, ignores spaces/underscores/hyphens), else None.
+    """
+    def norm(s: str) -> str:
+        return re.sub(r"[\s_\-]+", "", str(s).strip().lower())
 
-# Optional logos (won't crash if missing)
+    t = norm(target)
+    for c in df.columns:
+        if norm(c) == t:
+            return c
+    return None
+
+
+def _parse_float_cell(x) -> float | None:
+    s = safe_str(x)
+    if not s or s.lower() == "nan":
+        return None
+    # allow "141.02" or "NL=141.02" (extract first number)
+    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+def build_ms2nl_clause(nl_value: float | None, nl_tol: float, nl_ip: int) -> str:
+    """
+    AND MS2NL=(xxxxx):TOLERANCEMZ=0.03:INTENSITYPERCENT=5
+    """
+    if nl_value is None:
+        return ""
+    return f" AND MS2NL=({nl_value:.6f}):TOLERANCEMZ={nl_tol}:INTENSITYPERCENT={nl_ip}"
+
+
+# --- In your sidebar UI, add these settings (independent) ---
+# Put near your MS2 block:
+# use_nl = st.toggle("Add MS2NL constraint from 'Neutral Loss' column", value=False)
+# nl_tol = st.number_input("MS2NL TOLERANCEMZ", min_value=0.0001, max_value=1.0, value=0.03, step=0.001, format="%.4f", disabled=not use_nl)
+# nl_ip  = st.number_input("MS2NL INTENSITYPERCENT", min_value=1, max_value=100, value=5, step=1, disabled=not use_nl)
+
+
+# --- Then update your generate_queries signature to include: ---
+#   use_nl: bool, nl_tol: float, nl_ip: int
+#
+# and replace ONLY the MS2 clause assembly part with this block:
+
+# And in keep_cols, add these if enabled:
+# if use_ms2 and frag_col is not None: keep_cols.append(frag_col)
+# if use_nl and nl_col is not None: keep_cols.append(nl_col)
+
+
+# -----------------------------
+# LOGOs (optional)
+# -----------------------------
 STATIC_DIR = Path(__file__).parent / "static"
 for logo_name in ["logo_massQL.png", "LAABio.png"]:
     p = STATIC_DIR / logo_name
@@ -147,85 +325,153 @@ for logo_name in ["logo_massQL.png", "LAABio.png"]:
     except Exception:
         pass
 
-# Helpful links
-st.markdown(
-    """
----
-"""
-)
-
-
 # -----------------------------
 # UI
 # -----------------------------
-st.title("GPL MS1 MassQL Compendium Builder (Class/Subclass organized)")
-
-# Helpful links
-st.markdown(
-    """
----
-"""
-)
+st.title("MS1/MS2 MassQL Compendium Builder")
+st.markdown("---")
 
 with st.sidebar:
-    st.header("Settings")
-
-    tol = st.number_input("TOLERANCEMZ", min_value=0.0001, max_value=1.0, value=0.01, step=0.001, format="%.4f")
-    intensity_percent = st.number_input("INTENSITYPERCENT", min_value=1, max_value=100, value=40, step=10)#, format="%.4f")
+    st.header("MS1 Settings")
+    tol_ms1 = st.number_input("MS1 TOLERANCEMZ", min_value=0.0001, max_value=1.0, value=0.01, step=0.001, format="%.4f")
+    ip_ms1 = st.number_input("MS1 INTENSITYPERCENT", min_value=1, max_value=100, value=40, step=10)
 
     adducts = st.multiselect("Positive-mode adducts", ["H", "Na", "K", "NH4"], default=["H", "Na", "K"])
-    group_mode = st.radio(
-        "Compendium organization",
-        ["Class", 
-        #"Class + Subclass (Diacyl vs Lyso)"
-        ],
-        index=0
+
+    st.markdown("---")
+    st.header("MS2 (optional)")
+    use_ms2 = st.toggle("Add MS2PROD constraints from CSV column 'Fragments'", value=False)
+    tol_ms2 = st.number_input("MS2 TOLERANCEMZ", min_value=0.0001, max_value=1.0, value=0.02, step=0.001, format="%.4f", disabled=not use_ms2)
+    ip_ms2 = st.number_input("MS2 INTENSITYPERCENT", min_value=1, max_value=100, value=10, step=5, disabled=not use_ms2)
+
+    st.markdown("---")
+    st.header("MS2 Neutral Loss (optional)")
+    use_nl = st.toggle("Add MS2NL constraint from column 'Neutral Loss'", value=False)
+    nl_tol = st.number_input(
+        "MS2NL TOLERANCEMZ",
+        min_value=0.0001, max_value=1.0, value=0.03, step=0.001, format="%.4f",
+        disabled=not use_nl
+    )
+    nl_ip = st.number_input(
+        "MS2NL INTENSITYPERCENT",
+        min_value=1, max_value=100, value=5, step=1,
+        disabled=not use_nl
     )
 
-uploaded = st.file_uploader("Upload the GPL formula CSV", type=["csv"])
+    st.markdown("---")
+    group_mode = st.radio("Compendium organization", ["Class", "Class + Subclass (Diacyl vs Lyso)"], index=0)
+
+uploaded = st.file_uploader("Upload the formula file (csv/tsv)", type=["csv", "tsv", "txt"])
 
 if uploaded and adducts:
     try:
-        df_in = pd.read_csv(uploaded)
+        df_in = read_table_autodetect(uploaded)
         st.success(f"Loaded {len(df_in):,} rows.")
+
+        # Column detection messages (case-insensitive)
+        has_frags = _find_column_case_insensitive(df_in, "fragments") is not None
+        has_nl = (
+            _find_column_case_insensitive(df_in, "neutral loss") is not None
+            or _find_column_case_insensitive(df_in, "neutral_loss") is not None
+            or _find_column_case_insensitive(df_in, "neutralloss") is not None
+        )
+
+        if has_frags:
+            st.info("Detected column 'Fragments/fragments' (MS2PROD constraints available).")
+        else:
+            st.warning("No 'Fragments/fragments' column found (MS2PROD toggle will error if enabled).")
+
+        if has_nl:
+            st.info("Detected column 'Neutral Loss' (MS2NL constraints available).")
+        else:
+            st.warning("No 'Neutral Loss' column found (MS2NL toggle will error if enabled).")
 
         if st.button("Generate compendia", type="primary"):
             with st.spinner("Generating queries and compendia..."):
-                df_out = generate_queries(df_in, adducts, tol, intensity_percent)
+                df_out = generate_queries(
+                    df_in,
+                    adducts=adducts,
+                    tol_ms1=tol_ms1,
+                    ip_ms1=ip_ms1,
+                    use_ms2=use_ms2,
+                    tol_ms2=tol_ms2,
+                    ip_ms2=ip_ms2,
+                    use_nl=use_nl,
+                    nl_tol=nl_tol,
+                    nl_ip=nl_ip,
+                )
 
             st.success(f"Generated {len(df_out):,} queries.")
-
             st.markdown("### Preview")
-            st.dataframe(df_out[["Class", "Subclass", "Title", "Query"]].head(30), use_container_width=True)
+
+            frag_out_col = _find_column_case_insensitive(df_out, "fragments")
+            nl_out_col = (
+                _find_column_case_insensitive(df_out, "neutral loss")
+                or _find_column_case_insensitive(df_out, "neutral_loss")
+                or _find_column_case_insensitive(df_out, "neutralloss")
+            )
+
+            preview_cols = ["Class", "Subclass", "Title", "Query"]
+
+            # Insert MS2-related columns (if present) right before Title/Query area
+            if use_ms2 and frag_out_col is not None:
+                preview_cols.insert(3, frag_out_col)
+
+            if use_nl and nl_out_col is not None:
+                preview_cols.insert(3, nl_out_col)
+
+            st.dataframe(df_out[preview_cols].head(30), use_container_width=True)
 
             # Build compendia dict: filename -> df
-            compendia = {}
+            compendia: Dict[str, pd.DataFrame] = {}
 
-            if group_mode == "Class only":
+            # Build suffix that reflects what is enabled
+            suffix = "MS1"
+            if use_ms2:
+                suffix += "_MS2PROD"
+            if use_nl:
+                suffix += "_MS2NL"
+            suffix += ".tsv"
+
+            if group_mode == "Class":
                 for cls, subdf in df_out.groupby(["Class"]):
                     cls_name = cls if isinstance(cls, str) else cls[0]
-                    fname = f"GPL_{cls_name}_MS1.tsv"
+                    fname = f"GPL_{cls_name}_{suffix}"
                     compendia[fname] = subdf
             else:
                 for (cls, subcls), subdf in df_out.groupby(["Class", "Subclass"]):
-                    fname = f"GPL_{cls}_{subcls}_MS1.tsv"
+                    fname = f"GPL_{cls}_{subcls}_{suffix}"
                     compendia[fname] = subdf
 
-            zip_bytes = build_zip(compendia)
+            # README
+            readme = (
+                "MS1/MS2 MassQL Compendia\n"
+                f"- MS1: TOLERANCEMZ={tol_ms1}, INTENSITYPERCENT={ip_ms1}\n"
+                f"- Adducts={','.join([f'[M+{a}]+' for a in adducts])}\n"
+                f"- MS2PROD enabled={use_ms2}\n"
+                f"- MS2NL enabled={use_nl}\n"
+            )
+            if use_ms2:
+                readme += f"- MS2PROD: TOLERANCEMZ={tol_ms2}, INTENSITYPERCENT={ip_ms2}\n"
+                readme += "- MS2PROD Fragments source column: 'Fragments/fragments'\n"
+            if use_nl:
+                readme += f"- MS2NL: TOLERANCEMZ={nl_tol}, INTENSITYPERCENT={nl_ip}\n"
+                readme += "- MS2NL Neutral Loss source column: 'Neutral Loss' (case-insensitive)\n"
+
+            zip_bytes = build_zip(compendia, readme_text=readme)
 
             st.download_button(
                 "Download ZIP (one compendium TSV per group)",
                 data=zip_bytes,
-                file_name="GPL_MS1_compendia.zip",
+                file_name="GPL_compendia.zip",
                 mime="application/zip"
             )
 
-            # Optional: also download a full metadata table
             meta_csv = df_out.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "Download full metadata CSV (all queries)",
                 data=meta_csv,
-                file_name="GPL_MS1_queries_full.csv",
+                file_name="GPL_queries_full.csv",
                 mime="text/csv"
             )
 
