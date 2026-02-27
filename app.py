@@ -13,7 +13,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="GPL MS1/MS2 MassQL Compendium Builder", layout="wide")
+st.set_page_config(page_title="MS1/MS2 MassQL Compendium Builder", layout="wide")
 
 MONO_MASS = {
     "C": 12.0,
@@ -24,10 +24,11 @@ MONO_MASS = {
 }
 
 ADDUCT_SHIFT = {
-    "H": 1.007276466812,
-    "Na": 22.989218,
-    "K": 38.963158,
-    "NH4": 18.033823,
+    "M+H": lambda M: M + 1.007276466812,
+    "M+Na": lambda M: M + 22.989218,
+    "M+K": lambda M: M + 38.963158,
+    "M+NH4": lambda M: M + 18.033823,
+    "2M+H": lambda M: 2.0 * M + 1.007276466812,
 }
 
 FORMULA_TOKEN_RE = re.compile(r"([A-Z][a-z]?)(\d*)")
@@ -147,7 +148,7 @@ def infer_subclass(row: pd.Series) -> str:
 
 def generate_queries(
     df: pd.DataFrame,
-    adducts: List[str],
+    adducts: List[str],      # e.g. ["M+H","M+Na","M+K","M+NH4","2M+H"]
     tol_ms1: float,
     ip_ms1: int,
     use_ms2: bool,
@@ -183,10 +184,17 @@ def generate_queries(
             new_titles.append(t if seen[t] == 1 else f"{t}_{seen[t]}")
         df["Title"] = new_titles
 
+    # --- MS1 adduct handling (2M+H is just another selected adduct) ---
+    # IMPORTANT: ADDUCT_SHIFT must be a dict of callables:
+    #   ADDUCT_SHIFT["M+H"]  = lambda M: M + 1.007276466812
+    #   ADDUCT_SHIFT["2M+H"] = lambda M: 2*M + 1.007276466812
     def mzs(neutral_mass: float) -> List[float]:
-        return [neutral_mass + ADDUCT_SHIFT[a] for a in adducts]
+        bad = [a for a in adducts if a not in ADDUCT_SHIFT]
+        if bad:
+            raise ValueError(f"Unsupported adduct(s): {bad}. Allowed: {sorted(ADDUCT_SHIFT.keys())}")
+        return [float(ADDUCT_SHIFT[a](neutral_mass)) for a in adducts]
 
-    df["Adducts"] = ",".join([f"[M+{a}]+" for a in adducts])
+    df["Adducts"] = ",".join([f"[{a}]+" for a in adducts])
     df["AdductMZs"] = df["NeutralMass"].apply(lambda m: ",".join([f"{x:.6f}" for x in mzs(m)]))
 
     # MS1 clause
@@ -213,7 +221,10 @@ def generate_queries(
     if use_nl:
         nl_col = _find_column_case_insensitive(df, "neutral loss")
         if nl_col is None:
-            nl_col = _find_column_case_insensitive(df, "neutral_loss") or _find_column_case_insensitive(df, "neutralloss")
+            nl_col = (
+                _find_column_case_insensitive(df, "neutral_loss")
+                or _find_column_case_insensitive(df, "neutralloss")
+            )
         if nl_col is None:
             raise ValueError("MS2NL enabled, but file has no 'Neutral Loss' column (case-insensitive).")
 
@@ -336,7 +347,12 @@ with st.sidebar:
     tol_ms1 = st.number_input("MS1 TOLERANCEMZ", min_value=0.0001, max_value=1.0, value=0.01, step=0.001, format="%.4f")
     ip_ms1 = st.number_input("MS1 INTENSITYPERCENT", min_value=1, max_value=100, value=40, step=10)
 
-    adducts = st.multiselect("Positive-mode adducts", ["H", "Na", "K", "NH4"], default=["H", "Na", "K"])
+    adducts = st.multiselect(
+        "Positive-mode adducts",
+        ["M+H", "M+Na", "M+K", "M+NH4", "2M+H"],
+        default=["M+H", "M+Na", "M+K"]
+    )
+    
 
     st.markdown("---")
     st.header("MS2 (optional)")
@@ -399,7 +415,7 @@ if uploaded and adducts:
                     use_nl=use_nl,
                     nl_tol=nl_tol,
                     nl_ip=nl_ip,
-                )
+                )   
 
             st.success(f"Generated {len(df_out):,} queries.")
             st.markdown("### Preview")
@@ -436,21 +452,24 @@ if uploaded and adducts:
             if group_mode == "Class":
                 for cls, subdf in df_out.groupby(["Class"]):
                     cls_name = cls if isinstance(cls, str) else cls[0]
-                    fname = f"GPL_{cls_name}_{suffix}"
+                    fname = f"Compendium_{cls_name}_{suffix}"
                     compendia[fname] = subdf
             else:
                 for (cls, subcls), subdf in df_out.groupby(["Class", "Subclass"]):
-                    fname = f"GPL_{cls}_{subcls}_{suffix}"
+                    fname = f"MassQL_compendia_{cls}_{subcls}_{suffix}"
                     compendia[fname] = subdf
 
             # README
+            #adducts_readme = [f"[M+{a}]+" for a in adducts]
+            #if include_dimers:
+            #    adducts_readme.append("[2M+H]+")
             readme = (
                 "MS1/MS2 MassQL Compendia\n"
                 f"- MS1: TOLERANCEMZ={tol_ms1}, INTENSITYPERCENT={ip_ms1}\n"
-                f"- Adducts={','.join([f'[M+{a}]+' for a in adducts])}\n"
+                f"- Adducts={','.join(adducts_readme)}\n"
                 f"- MS2PROD enabled={use_ms2}\n"
                 f"- MS2NL enabled={use_nl}\n"
-            )
+            )   
             if use_ms2:
                 readme += f"- MS2PROD: TOLERANCEMZ={tol_ms2}, INTENSITYPERCENT={ip_ms2}\n"
                 readme += "- MS2PROD Fragments source column: 'Fragments/fragments'\n"
@@ -463,7 +482,7 @@ if uploaded and adducts:
             st.download_button(
                 "Download ZIP (one compendium TSV per group)",
                 data=zip_bytes,
-                file_name="GPL_compendia.zip",
+                file_name="MassQL_compendia.zip",
                 mime="application/zip"
             )
 
@@ -471,7 +490,7 @@ if uploaded and adducts:
             st.download_button(
                 "Download full metadata CSV (all queries)",
                 data=meta_csv,
-                file_name="GPL_queries_full.csv",
+                file_name="MassQL_queries_full.csv",
                 mime="text/csv"
             )
 
