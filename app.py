@@ -1,4 +1,4 @@
-# --- ADD THIS FEATURE TO YOUR EXISTING app.py ---
+
 # MS2 fragment constraints (optional) read from CSV column "fragments"
 # Builds an additional clause:
 #   AND MS2PROD=(m1 OR m2 OR ...):TOLERANCEMZ=xx:INTENSITYPERCENT=xxx
