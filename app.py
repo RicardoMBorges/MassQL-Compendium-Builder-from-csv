@@ -496,7 +496,7 @@ if uploaded and adducts:
                 mime="application/zip",
             )
 
-            meta_csv = df_out.to_csv(index=False).encode("utf-8")
+            meta_csv = df_out.to_csv(sep="\t", index=False).encode("utf-8")
             st.download_button(
                 "Download full metadata CSV (all queries)",
                 data=meta_csv,
