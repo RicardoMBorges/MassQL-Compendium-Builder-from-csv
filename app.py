@@ -133,7 +133,7 @@ def build_generic_title(row: pd.Series, id_col: str) -> str:
 
 def build_ms1_clause(mz_list: List[float], tol_ms1: float, ip_ms1: int) -> str:
     mz_str = " OR ".join([f"{mz:.6f}" for mz in mz_list])
-    return f"MS1MZ=({mz_str}):TOLERANCEMZ={tol_ms1}:INTENSITYPERCENT={ip_ms1}"
+    return f"MS2PREC=({mz_str}):TOLERANCEMZ={tol_ms1}:INTENSITYPERCENT={ip_ms1}"
 
 
 
